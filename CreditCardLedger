@@ -21,3 +21,254 @@ defmodule CreditCardLedger.Entity.Transaction do
     |> apply_changes()
   end
 end
+
+defmodule CreditCardLedger.Entity.User do
+  use Ecto.Schema
+  import Ecto.Changeset
+
+  @primary_key {:id, :binary_id, autogenerate: true}
+
+  schema "users" do
+    field :fullname, :string
+    field :credit_limit, :float
+    field :inserted_at, :naive_datetime
+  end
+
+  @spec cast(:invalid | %{optional(:__struct__) => none, optional(atom | binary) => any}) :: map
+  def cast(params) do
+    now = NaiveDateTime.truncate(NaiveDateTime.utc_now(), :second)
+
+    %__MODULE__{inserted_at: now}
+    |> cast(params, [:fullname, :credit_limit])
+    |> validate_required([:fullname, :credit_limit])
+    |> apply_changes()
+  end
+end
+
+defmodule CreditCardLedger.AccountWorker do
+  use GenServer
+  alias CreditCardLedger.Transaction
+
+  def start_link({user_id, worker_name}) do
+    GenServer.start_link(__MODULE__, user_id, name: worker_name)
+  end
+
+  def init(_user_id) do
+    {:ok, %{}}
+  end
+
+  def handle_call({:add_transaction, params}, _from, state) do
+    result = Transaction.add_transaction(params.user_id, params.amount)
+    {:reply, result, state}
+  end
+end
+
+defmodule CreditCardLedger.Application do
+  # See https://hexdocs.pm/elixir/Application.html
+  # for more information on OTP Applications
+  @moduledoc false
+  require Logger
+  use Application
+  @http_port 8080
+
+  def start(_type, _args) do
+    Logger.info("Starting http server at port #{@http_port}")
+
+    children = [
+      CreditCardLedger.Repo,
+      {Plug.Cowboy, scheme: :http, plug: CreditCardLedgerHTTP.Router, options: [port: @http_port]},
+      CreditCardLedger.SafeTransaction,
+    ]
+
+    # See https://hexdocs.pm/elixir/Supervisor.html
+    # for other strategies and supported options
+    opts = [strategy: :one_for_one, name: CreditCardLedger.Supervisor]
+    Supervisor.start_link(children, opts)
+  end
+end
+
+defmodule CreditCardLedger.Repo do
+  use Ecto.Repo,
+    otp_app: :credit_card_ledger,
+    adapter: Ecto.Adapters.MyXQL
+end
+
+defmodule CreditCardLedger.SafeTransaction do
+  use DynamicSupervisor
+  alias CreditCardLedger.AccountWorker
+
+  def start_link(args), do: DynamicSupervisor.start_link(__MODULE__, args, name: __MODULE__)
+
+  def init(_args) do
+    DynamicSupervisor.init(strategy: :one_for_one)
+  end
+
+  def add_transaction(user_id, amount) do
+    {:ok, pid} = get_or_create_worker(user_id)
+    GenServer.call(pid, {:add_transaction, %{user_id: user_id, amount: amount}})
+  end
+
+  @spec get_or_create_worker(any) :: :ignore | {:error, any} | {:ok, pid | port} | {:ok, pid, any}
+  def get_or_create_worker(user_id) do
+    worker_name = :"AccountWorker.#{user_id}"
+
+    case Process.whereis(worker_name) do
+      nil ->
+        DynamicSupervisor.start_child(
+          __MODULE__,
+          {AccountWorker, {user_id, worker_name}}
+        )
+
+      pid ->
+        {:ok, pid}
+    end
+  end
+end
+
+defmodule CreditCardLedger.Transaction do
+  alias CreditCardLedger.Repo
+  alias CreditCardLedger.Entity.{User, Transaction}
+  import Ecto.Query
+
+  def add_transaction(user_id, amount) do
+    with user = %User{} <- Repo.get(User, user_id),
+         used_limit <- get_available_limit(user) do
+      case (used_limit + amount) <= user.credit_limit do
+        true ->  Transaction.cast(%{amount: amount}, user) |> Repo.insert()
+        false -> :error
+      end
+    end
+  end
+
+  defp get_available_limit(%{id: user_id}) do
+    from(t in Transaction, where: t.user_id == ^user_id, select: sum(t.amount))
+    |> Repo.all()
+    |> IO.inspect()
+    |> case do
+      [nil] -> 0.0
+      [number] -> number
+      _ -> 0.0
+    end
+  end
+end
+
+defmodule CreditCardLedger.Transaction do
+  alias CreditCardLedger.Repo
+  alias CreditCardLedger.Entity.{User, Transaction}
+  import Ecto.Query
+
+  def add_transaction(user_id, amount) do
+    with user = %User{} <- Repo.get(User, user_id),
+         used_limit <- get_available_limit(user) do
+      case (used_limit + amount) <= user.credit_limit do
+        true ->  Transaction.cast(%{amount: amount}, user) |> Repo.insert()
+        false -> :error
+      end
+    end
+  end
+
+  defp get_available_limit(%{id: user_id}) do
+    from(t in Transaction, where: t.user_id == ^user_id, select: sum(t.amount))
+    |> Repo.all()
+    |> IO.inspect()
+    |> case do
+      [nil] -> 0.0
+      [number] -> number
+      _ -> 0.0
+    end
+  end
+end
+
+defmodule CreditCardLedgerHTTP.Handler do
+  import Plug.Conn
+
+  def index(conn) do
+    conn
+    |> IO.inspect(label: "Connection")
+    |> put_resp_content_type("text/plain")
+    |> send_resp(:ok, "Ola")
+  end
+end
+
+defmodule CreditCardLedgerHTTP.Router do
+  use Plug.Router
+  import Plug.Conn
+
+  plug(:fetch_query_params)
+  plug(:match)
+  plug(:dispatch)
+
+  get("/", do: CreditCardLedgerHTTP.Handler.index(conn))
+end
+
+defmodule CreditCardLedger do
+  @moduledoc """
+  Documentation for `CreditCardLedger`.
+  """
+
+  def hello do
+    :mundo
+  end
+end
+
+defmodule CreditCardLedger.Repo.Migrations.CreateUsersTable do
+  use Ecto.Migration
+
+  def change do
+    create table(:users, primary_key: false) do
+      add :id, :uuid, primary_key: true
+      add :fullname, :string, nullable: false
+      add :credit_limit, :float, nullable: false
+      add :inserted_at, :naive_datetime
+    end
+  end
+end
+
+defmodule CreditCardLedger.Repo.Migrations.CreateTransactionTable do
+  use Ecto.Migration
+
+  def change do
+    create table(:transactions, primary_key: false) do
+      add :id, :uuid, primary_key: true
+      add :amount, :float, nullable: false
+      add :user_id, references(:users, type: :uuid)
+      add :inserted_at, :naive_datetime
+    end
+  end
+end
+
+
+defmodule CreditCardLedgerTest do
+  use ExUnit.Case
+
+  test "greets the world" do
+    assert CreditCardLedger.hello() == :mundo
+  end
+end
+
+defmodule CreditCardLedger.Entity.UserTest do
+  use ExUnit.Case
+  alias CreditCardLedger.Entity.User
+  alias CreditCardLedger.Repo
+
+  test "save a user in the database" do
+    params = %{
+      fullname: "Some Body"
+    }
+
+    changeset = User.cast(params)
+    Repo.insert(changeset)
+
+    users = Repo.all(User)
+    assert [%User{}] = users
+  end
+end
+
+ExUnit.start()
+Ecto.Adapters.SQL.Sandbox.mode(CreditCardLedger.Repo, :manual)
+
+
+# Used by "mix format"
+[
+  inputs: ["{mix,.formatter}.exs", "{config,lib,test}/**/*.{ex,exs}"]
+]
